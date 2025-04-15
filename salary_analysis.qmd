@@ -1,0 +1,756 @@
+---
+title: "Singapore Tech Jobs Analysis"
+format: 
+  revealjs:
+    theme: [default,style.scss]  
+    logo: DedumoLogo.png
+---
+
+```{r}
+#| label: libraries
+#| include: false
+#| eval: true
+#| message: false
+#| warning: false
+
+library(data.table)
+library(ggplot2)
+library(googlesheets4)
+library(stringr)
+library(tidytext)
+library(dplyr)
+library(widyr)
+library(tidyr)
+library(patchwork)
+library(networkD3)
+library(htmltools)
+library(plotly)
+library(camcorder)
+
+
+# Plot size
+gg_record(
+  dir = file.path(".","salary_exports"), 
+  device = "png", 
+  width = 30, 
+  height = 20, 
+  units = "cm", 
+  dpi = 300 
+)
+
+```
+
+```{r}
+#| label: load-techsalary-data
+#| include: false
+#| eval: true
+#| message: false
+#| warning: false
+
+gs4_deauth()
+tech.jobs.2023 <- googlesheets4::read_sheet('https://docs.google.com/spreadsheets/d/1i6qC_-tv0RoSGlyR6UKjGA4xkepSaj7Iya2AYC_m-2Q/edit?gid=1733111772#gid=1733111772',sheet = 'Jan-March 2023')
+tech.jobs.2024 <- googlesheets4::read_sheet('https://docs.google.com/spreadsheets/d/1i6qC_-tv0RoSGlyR6UKjGA4xkepSaj7Iya2AYC_m-2Q/edit?gid=1733111772#gid=1733111772',sheet = 'Jan-March 2024')
+tech.jobs.2025 <- googlesheets4::read_sheet('https://docs.google.com/spreadsheets/d/1i6qC_-tv0RoSGlyR6UKjGA4xkepSaj7Iya2AYC_m-2Q/edit?gid=1733111772#gid=1733111772',sheet = 'Jan-March 2025')
+
+# combine the three sheets
+tech.jobs <- rbind(tech.jobs.2023,tech.jobs.2024,tech.jobs.2025) 
+
+```
+
+
+```{r}
+#| label: wrangle-clean
+#| include: false
+#| eval: true
+#| message: false
+#| warning: false
+
+# Remove surrounding quotes from all columns
+tech.jobs <- data.table(tech.jobs)[, lapply(.SD, function(x) gsub('(^"|"$)', '', x))]
+
+# Date
+## Extract the year from date column and drop the original column
+tech.jobs <- tech.jobs[,year := year(as.IDate(gsub('"', '', `Date Posted`)))][,`Date Posted`:=NULL]
+
+# Salary
+## There is a mix of currency (Mostly SGD, but we also have some in USD,IDR and TWD) - standardize
+
+### Convert USD to SGD (Use 1 USD == 1.35 SGD)
+tech.jobs[grepl("USD$", `Monthly Salary`), `Monthly Salary` := {
+  range_parts <- tstrsplit(gsub(" USD", "", `Monthly Salary`), "-")
+  lower <- as.numeric(range_parts[[1]]) * 1.35
+  upper <- as.numeric(range_parts[[2]]) * 1.35
+  paste0(round(lower), "-", round(upper), " SGD")
+}]
+
+### Convert IDR to SGD (Use 1 SGD = 11500 IDR)
+tech.jobs[grepl("IDR$", `Monthly Salary`), `Monthly Salary` := {
+  range_parts <- tstrsplit(gsub(" USD", "", `Monthly Salary`), "-")
+  lower <- as.numeric(range_parts[[1]]) / 11500
+  upper <- as.numeric(range_parts[[2]]) * 11500
+  paste0(round(lower), "-", round(upper), " SGD")
+}]
+
+### Convert USD to SGD (Use 1 TWD == 0.041 SGD)
+tech.jobs[grepl("TWD$", `Monthly Salary`), `Monthly Salary` := {
+  range_parts <- tstrsplit(gsub(" USD", "", `Monthly Salary`), "-")
+  lower <- as.numeric(range_parts[[1]]) * 0.041
+  upper <- as.numeric(range_parts[[2]]) * 0.041
+  paste0(round(lower), "-", round(upper), " SGD")
+}]
+
+### The salary comes in a range - extract the min from the numeric range. Also drop the currency given that we've standardized it to SGD.
+tech.jobs <- tech.jobs[, salary_lower := as.numeric(tstrsplit(gsub(" SGD", "", `Monthly Salary`), "-")[[1]])][, salary_upper := as.numeric(tstrsplit(gsub(" SGD", "", `Monthly Salary`), "-")[[2]])]
+
+
+```
+
+## Quantity of Jobs
+```{r}
+#| label: quantity-jobs
+#| include: true
+#| eval: true
+#| message: false
+#| warning: false
+qty.jobs <- tech.jobs[,.(count.jobs=.N),by=year]
+
+qty.jobs %>%
+ggplot(aes(x=year,y=count.jobs,fill=year)) +
+  geom_col(fill='#55bc7e') +
+  labs(x='Year',y='No. of jobs',title = 'Total number of job listings') +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+- There was a surge in the number of jobs from 2023 to 2024 and a sharp drop in 2025.  
+- This might be as a result of economic uncertainties, shifts in hiring strategies due to global tech layoffs, tighter budgets, and a myriad other potential reasons. Observing this trend for the next couple of years might help to reveal the potential reasons.   
+
+
+## Top Skills (By Demand)
+```{r}
+#| label: top-skills
+#| include: true
+#| eval: true
+#| message: false
+#| warning: false
+
+# Explode the skills column
+dt_skills <- tech.jobs[, .(skill = unlist(strsplit(Skills, ","))), by = year]
+
+# Clean up whitespace
+dt_skills[, skill := trimws(skill)]
+
+# Count skill frequency by year
+skill_counts <- dt_skills[, .N, by = .(year, skill)]
+
+# Get top 20 skills per year
+top_skills <- skill_counts[
+  order(-N), 
+  head(.SD, 20), 
+  by = year
+]
+
+# Order skills by frequency for better plotting
+top_skills[, skill := factor(skill, levels = unique(skill[order(-N)])), by = year]
+
+
+ggplot(top_skills, aes(x = reorder_within(skill, N, year), y = N, fill = skill)) +
+  geom_bar(stat = "identity", show.legend = FALSE, fill = "#55bc7e") +
+  coord_flip() +
+  facet_wrap(~ year, scales = "free_y") +
+  scale_x_reordered() +
+  labs(
+    title = "Top 20 Skills in Tech Job Listings by Year",
+    subtitle = "Skills ranked by frequency of mention",
+    x = NULL,
+    y = "Number of Mentions",
+    caption = "Data source: Tech job listings analysis"
+  ) +
+  theme_classic(base_size = 16) +  # Base font size increased
+  theme(
+    strip.text = element_text(size = 18, face = "bold"),      # Facet labels
+    axis.text = element_text(size = 14),                      # Axis tick labels
+    axis.title = element_text(size = 16, face = "bold"),      # Axis titles
+    plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 16),
+    plot.caption = element_text(size = 12, face = "italic")
+  )
+
+
+```
+
+
+- SQL makes a notable debut in 2024, entering straight into third place. Docker also emerges as a rising star - it appears in 2024 and climbs five spots in 2025. This upward trend suggests Docker is becoming an increasingly valuable skill to watch. 
+- JavaScript shows a surprising decline, dropping one spot from 2023 t0 2024 before completely disappearing from the top 20 in 2025 - That's such a notable shift for such a widely used language!  
+- Java and Python continue to demonstrate lasting relevance. Java holds firmly at the top spot for three consecutive years, while Python climbs to second place in 2024 and retains its position in 2025.  
+
+## Median Salary Trends
+```{r}
+#| label: mean-median-salaries-lower-range
+#| include: true
+#| eval: true
+#| message: false
+#| warning: false
+
+tech.jobs.salary <- tech.jobs[!is.na(salary_lower)]
+
+# Summarise statistics per year
+salary_stats <- tech.jobs.salary[, .(
+  mean_salary = mean(salary_lower, na.rm = TRUE),
+  median_salary = median(salary_lower, na.rm = TRUE),
+  p10 = quantile(salary_lower, 0.10, na.rm = TRUE),
+  p90 = quantile(salary_lower, 0.90, na.rm = TRUE)
+), by = year]
+# Custom color palette (blue/teal theme)
+my_colors <- c("Mean" = "#2C73D2", "Median" = "#008B8B", 
+               "10th Percentile" = "#66A9C9", "90th Percentile" = "#36454F")
+
+# Enhanced plot with percentile range
+ggplot(salary_stats, aes(x = year)) +
+  # Add percentile range as ribbon
+  geom_ribbon(aes(ymin = p10, ymax = p90, fill = "Salary Range (10-90th Percentile)"), 
+              alpha = 0.2) +
+  # Add mean and median lines
+  geom_line(aes(y = mean_salary, color = "Mean"), linewidth = 1.2) +
+  geom_line(aes(y = median_salary, color = "Median"), linewidth = 1.2, 
+            linetype = "dashed") +
+  # Add points for better visibility at each year
+  geom_point(aes(y = mean_salary, color = "Mean"), size = 3) +
+  geom_point(aes(y = median_salary, color = "Median"), size = 3) +
+  # Add percentile lines (lighter)
+  geom_line(aes(y = p10, color = "10th Percentile"), linewidth = 0.8, 
+            linetype = "dotted") +
+  geom_line(aes(y = p90, color = "90th Percentile"), linewidth = 0.8, 
+            linetype = "dotted") +
+  # Set custom colors
+  scale_color_manual(values = my_colors) +
+  scale_fill_manual(values = c("Salary Range (10-90th Percentile)" = "#E6F6EC")) +
+  scale_x_continuous(breaks=unique(salary_stats$year)) +
+  # Improve labels
+  labs(title = "2023 - 2025 Tech Jobs Salary Trends",
+       subtitle = "Rising pay - Growth fueled by few roles",
+       y = "Monthly Salary offer (SGD)", 
+       x = "Year",
+       caption = "Data source: Tech job listings in Singapore") +
+  # Custom theme with grid lines for better readability
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12, color = "gray40"),
+    axis.title = element_text(face = "bold"),
+    legend.title = element_blank(),
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "white"),
+    plot.margin = margin(20, 20, 20, 20)
+  ) +
+  # Ensure the legend has a good order
+  guides(color = guide_legend(order = 1), 
+         fill = guide_legend(order = 2))
+
+```
+
+- Lower-range salary offers have steadily increased over the past three years, with both the mean and median showing a consistent upward trend. 
+- The mean lower-range salary consistently exceeds the median, indicating a right-skewed distribution. This suggests that a smaller number of high-paying roles are pulling the average upward.  
+- Between 2024 and 2025, there is a noticeable shift in salary distribution: the 90th percentile salaries experienced a decline, indicating a dip among the highest earners, while the 10th percentile saw an increase, suggesting improved compensation for entry-level or lower-paid roles.  
+ 
+
+```{r}
+#| label: mean-median-salaries-upper-end
+#| include: false
+#| eval: false
+#| message: false
+#| warning: false
+
+tech.jobs.salary.upper <- tech.jobs[!is.na(salary_upper)]
+
+# Summarise statistics per year
+salary_stats.upper <- tech.jobs.salary.upper[, .(
+  mean_salary = mean(salary_upper, na.rm = TRUE),
+  median_salary = median(salary_upper, na.rm = TRUE),
+  p10 = quantile(salary_upper, 0.10, na.rm = TRUE),
+  p90 = quantile(salary_upper, 0.90, na.rm = TRUE)
+), by = year]
+
+# Custom color palette (blue/teal theme)
+my_colors <- c("Mean" = "#2C73D2", "Median" = "#008B8B", 
+               "10th Percentile" = "#66A9C9", "90th Percentile" = "#36454F")
+
+# Enhanced plot with percentile range
+ggplot(salary_stats.upper, aes(x = year)) +
+  # Add percentile range as ribbon
+  geom_ribbon(aes(ymin = p10, ymax = p90, fill = "Salary Range (10-90th Percentile)"), 
+              alpha = 0.2) +
+  # Add mean and median lines
+  geom_line(aes(y = mean_salary, color = "Mean"), linewidth = 1.2) +
+  geom_line(aes(y = median_salary, color = "Median"), linewidth = 1.2, 
+            linetype = "dashed") +
+  # Add points for better visibility at each year
+  geom_point(aes(y = mean_salary, color = "Mean"), size = 3) +
+  geom_point(aes(y = median_salary, color = "Median"), size = 3) +
+  # Add percentile lines (lighter)
+  geom_line(aes(y = p10, color = "10th Percentile"), linewidth = 0.8, 
+            linetype = "dotted") +
+  geom_line(aes(y = p90, color = "90th Percentile"), linewidth = 0.8, 
+            linetype = "dotted") +
+  # Set custom colors
+  scale_color_manual(values = my_colors) +
+  scale_fill_manual(values = c("Salary Range (10-90th Percentile)" = "#E6F6EC")) +
+  scale_x_continuous(breaks=unique(salary_stats.upper$year)) +
+  # Improve labels
+  labs(title = "2023 - 2025 Tech Jobs Upper-End Salary Trends",
+       subtitle = "Rising pay - Growth fueled by few roles",
+       y = "Monthly Salary offer (SGD)", 
+       x = "Year",
+       caption = "Data source: Tech job listings in Singapore") +
+  # Custom theme with grid lines for better readability
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 12, color = "gray40"),
+    axis.title = element_text(face = "bold"),
+    legend.title = element_blank(),
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "gray90"),
+    plot.margin = margin(20, 20, 20, 20)
+  ) +
+  # Ensure the legend has a good order
+  guides(color = guide_legend(order = 1), 
+         fill = guide_legend(order = 2)) 
+
+# - The upper range salaries show a similar trend, a drop in the 90th percentile from the year 2024 to 2025 and an increase in the 10th percentile. 
+```
+
+
+
+```{r}
+#| label: job-titles-wrangling
+#| include: true
+#| eval: true
+#| message: false
+#| warning: false
+
+# Step 1: Normalize the text
+tech.jobs[, title_clean := str_to_lower(`Job Title`)] # Lowercase
+tech.jobs[, title_clean := str_replace_all(title_clean, "[^a-z ]", " ")]  # Remove special characters
+tech.jobs[, title_clean := str_squish(title_clean)] # Trim whitespace
+
+# Step 2: Categorize based on patterns
+tech.jobs.titles <- tech.jobs[, category := fifelse(str_detect(title_clean, "Engineer|Engineering|engineer"),
+                         "Engineering",
+                 fifelse(str_detect(title_clean, "Data|data"),
+                         "Data",
+                 fifelse(str_detect(title_clean, "Developer|developer"),
+                         "Developer",
+                 fifelse(str_detect(title_clean, "devops|DevOps"),
+                         "DevOps",
+                 fifelse(str_detect(title_clean, "ui/ux|UX/UI"),
+                         "UI/UX",
+                 fifelse(str_detect(title_clean, "Cyber Security|cybersecurity"),
+                         "Cyber Security",
+                 fifelse(str_detect(title_clean, "Consultant|consultant"),
+                         "Consultant",
+                 fifelse(str_detect(title_clean, "Architect|architect"),
+                         "Architect",
+                 fifelse(str_detect(title_clean, "Frontend|Front-End|Front End"),
+                         "DevOps Engineer",
+                 fifelse(str_detect(title_clean, "Programmer|Programming"),
+                         "Project Manager",
+                         fifelse(str_detect(title_clean, "Backend|Back-End"),
+                         "Back-End",
+                         fifelse(str_detect(title_clean, "Cloud|cloud"),
+                         "Cloud",
+                         fifelse(str_detect(title_clean, "Analyst|analyst"),
+                         "Analyst",
+                         "Other")))))))))))))
+                 #))))
+]
+
+tech.jobs.title.category.count <- tech.jobs.titles[,.(category.counts=.N),by=c('category','year')]
+
+```
+
+## Job Titles (Diversity & Demand)  
+
+```{r}
+#| label: job-titles-diversity-demand
+#| include: true
+#| eval: true
+#| message: false
+#| warning: false
+
+# Ensure year is a factor for ordering
+tech.jobs.title.category.count[, year := as.factor(year)]
+
+# Plot with facets per year
+ggplot(tech.jobs.title.category.count, aes(x = reorder_within(category, category.counts, year), y = category.counts, fill = category)) +
+  geom_bar(stat = "identity", show.legend = FALSE, fill = "#55bc7e") +
+  geom_text(aes(label = category.counts), 
+            hjust = -0.1, size = 3) +  # Adjust hjust for horizontal bars
+  coord_flip(clip = 'off') +
+  facet_wrap(~ year, scales = "free_y") +
+  scale_x_reordered() +  # needed to clean up axis labels
+  labs(
+    title = "Top Job Titles",
+    subtitle = " ",
+    x = NULL,  # Remove x axis label as it's self-explanatory
+    y = "Number of Mentions",
+    caption = "Data source: Tech job listings analysis"
+  ) +
+  theme_classic() +
+  theme(strip.text = element_text(size = 12, face = "bold"),
+        plot.title = element_text(hjust = 0.5)) 
+
+
+```
+
+- Engineering and Developer roles consistently dominated job postings over the three year period, highlighting a strong demand for technical expertise in software and systems development.   
+- Analyst and Architect positions also featured prominently - this reflects the growing importance of data-driven decision-making and robust system design.   
+- Consultant roles maintained a steady presence, suggesting a sustained need for strategic advisory and specialized implementation support across the tech sector.  
+
+## Job Titles - Drill down
+```{r fig.width=12, fig.height=6}
+#| label: job-titles-diversity-demand-drill-down-associated-words
+#| include: true
+#| eval: true
+#| message: false
+#| warning: false
+
+# Clean and tokenize job titles
+tech.jobs.keyword <- tech.jobs.titles[,.(`Job Title`)][, id := .I]  # add an ID for each title
+
+tokens <- tech.jobs.keyword %>%
+  unnest_tokens(word, `Job Title`) %>%
+  filter(!word %in% stop_words$word) %>%
+  filter(str_detect(word, "[a-z]"))  # filter non-empty
+
+# Step 2: Define keywords
+keywords <- c("engineer", "developer", "data","designer","architect","analyst","cloud","consultant", "cyber")
+
+# Step 3: Get pairwise word correlations
+word_pairs <- tokens %>%
+  pairwise_cor(item = word, feature = id, sort = TRUE)
+
+# Step 4: For each keyword, extract top associated words and plot
+plots <- lapply(keywords, function(kword) {
+  top_corr <- word_pairs %>%
+    filter(item1 == kword | item2 == kword) %>%
+    mutate(associated = ifelse(item1 == kword, item2, item1)) %>%
+    filter(associated != kword) %>%
+    arrange(desc(correlation)) %>%
+    slice_head(n = 10)
+  
+  ggplot(top_corr, aes(x = reorder(associated, correlation), y = correlation)) +
+    geom_col(fill = "#55bc7e") +
+    coord_flip() +
+    labs(
+      title = paste("Top words associated with", str_to_title(kword)),
+      x = " ", y = "Correlation"
+    ) +
+    theme_classic()
+})
+
+# Step 5: Display plots
+wrap_plots(plots, ncol = 3)
+
+```
+
+- As seen in the previous slide, Engineering roles dominated job listings. This graph breaks it down further, showing that the majority were Software Engineering roles, followed by DevOps Engineering roles.   
+- Among Developer roles, Full-Stack and Java Developers stood out. This aligns with the earlier skill analysis, where Java emerged as the most frequently mentioned skill.   
+- Data-related roles were primarily Data Scientist positions, highlighting the growing demand for advanced analytics and perhaps machine learning expertise.   
+- Cybersecurity and UI/UX Design roles also made notable appearences, reflecting the increasing focus on digital security and user-centered design.   
+- The majority of Architect roles were Solution Architects, emphasizing a focus on designing comprehensive technical solutions for complex business needs.   
+- Business Analyst roles made up the bulk of Analyst positions, this highlights the demand for professional skilled in bridging the gap between data and decision-making.   
+- The term 'Cloud' was most frequently linked to infrastructure and AWS, suggesting that cloud computing roles are heavily centered around scalable architecture and Amazon's Cloud Services.    
+
+## Top Titles and Skill mentions
+```{r fig.width=12, fig.height=6}
+#| label: job-titles-skills
+#| include: true
+#| eval: true
+#| message: false
+#| warning: false
+
+# Split skills and unnest
+skills.titles_df <- tech.jobs.titles[, .(skill = unlist(strsplit(Skills, ","))), by = category]
+
+# Trim any whitespace
+skills.titles_df[, skill := trimws(skill)]
+
+# Count frequencies
+skill.titles_counts <- skills.titles_df[, .N, by = .(category, skill)]
+
+# For each category, get top 5 skills
+top_skills.titles <- skill.titles_counts[order(-N), head(.SD, 5), by = category]
+
+# Split data by category
+category_plots <- split(top_skills.titles, top_skills.titles$category)
+
+# Generate individual plots for each category
+plots <- lapply(names(category_plots), function(cat_name) {
+  dat <- category_plots[[cat_name]]
+  
+  ggplot(dat, aes(x = reorder(skill, N), y = N)) +
+    geom_col(fill = "#55bc7e") +
+    coord_flip() +
+    labs(
+      title = paste("Top Skills in", cat_name),
+      x = " ", y = "Count"
+    ) +
+    theme_classic() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.text = element_text(size = 10),
+      axis.title.y = element_blank()
+    )
+})
+
+# Arrange all plots in a grid (3 per row, or adjust as needed)
+wrap_plots(plots, ncol = 3)
+
+```
+ 
+- SQL emerges as the most in-demand skill for Data and Analyst roles, highlighting its central role in data manipulation, querying, and reporting.   
+ 
+- Python leads as the top skill for Engineering roles, reflecting its versatility and widespread use in building robust data and software systems.   
+
+- Cloud-related roles show a clear preference for Azure, while AWS takes the lead in DevOps roles, indicating specialized usage patterns and organizational preferences across different infrastructure needs.    
+
+- Java stands out as the most frequently required skill for Developer roles, emphasizing its enduring relevance in backend and enterprise-level software development.    
+
+
+## AI-Related Jobs
+```{r}
+#| label: ai-related-jobs-quantity
+#| include: true
+#| eval: true
+#| message: false
+#| warning: false
+
+# 1. Filter for rows with 'AI' in job_title or description (case insensitive)
+tech.jobs.ai <- tech.jobs[str_detect(`Job Title`, regex("\\bAI\\b", ignore_case = TRUE)) |
+              str_detect(Posting, regex("\\bAI\\b", ignore_case = TRUE))]
+
+# 2. Count AI-related jobs by year
+ai_jobs_by_year <- tech.jobs.ai[, .N, by = year][order(year)]
+
+# 3. Extract words associated with 'AI' in the job_title
+get_ai_assoc <- function(title) {
+  if (!str_detect(title, regex("\\bAI\\b", ignore_case = TRUE))) return(NULL)
+  words <- unlist(str_split(title, "\\s+"))
+  words <- str_remove_all(words, "[^A-Za-z]")
+  words <- tolower(words)
+  words <- words[words != "" & words != "ai"]
+  return(words)
+}
+
+ai_words <- unlist(lapply(tech.jobs.ai$`Job Title`, get_ai_assoc))
+
+# Count associated words
+ai_assoc_df <- data.table(word = ai_words)[, .N, by = word][order(-N)]
+
+
+## AI jobs by year
+ggplot(ai_jobs_by_year, aes(x = year, y = N)) +
+  geom_col(fill = "#55bc7e") +
+  labs(title = "Number of AI-Related Jobs by Year", x = "Year", y = "Number of Jobs") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+ 
+- The steady increase in AI-related jobs over the past three years indicates a sustained and growing demand for AI talent, this reflects an expanding adoption of AI technology across industries and their importance in driving innovation and efficiency. 
+
+## Titles in AI-tagged jobs
+
+```{r}
+#| label: AI-related-jobs-common-titles
+#| include: true
+#| eval: true
+#| message: false
+#| warning: false
+
+# 3. Extract bigrams associated with 'AI' in the job_title
+get_ai_bigrams <- function(title) {
+  if (!str_detect(title, regex("\\bAI\\b", ignore_case = TRUE))) return(NULL)
+  words <- unlist(str_split(title, "\\s+"))
+  words <- str_remove_all(words, "[^A-Za-z]")
+  words <- tolower(words)
+  words <- words[words != "" & words != "ai"]
+  
+  if (length(words) < 2) return(NULL)
+  
+  # Create bigrams
+  bigrams <- paste(head(words, -1), tail(words, -1))
+  return(bigrams)
+}
+
+# Apply the function
+ai_bigrams <- unlist(lapply(tech.jobs.ai$`Job Title`, get_ai_bigrams))
+
+# Count associated bigrams
+ai_bigram_df <- data.table(bigram = ai_bigrams)[, .N, by = bigram][order(-N)]
+
+## Top words associated with AI
+top_twowords <- ai_bigram_df[1:10]
+
+top_twowords$ai <- 'AI'
+
+names(top_twowords) <- c('target','value','source')
+
+# Create node list (unique names)
+nodes <- data.table(name = unique(c(top_twowords$source, top_twowords$target)))
+
+# Create link list using index of node list
+top_twowords[, source_id := match(source, nodes$name) - 1]
+top_twowords[, target_id := match(target, nodes$name) - 1]
+
+# Create Sankey diagram
+htmlwidgets::prependContent(
+  htmlwidgets::appendContent(
+sankeyNetwork(Links = top_twowords[, .(source_id, target_id, value)],
+              Nodes = nodes,
+              Source = "source_id",
+              Target = "target_id",
+              Value = "value",
+              NodeID = "name",
+              fontSize = 14,
+              nodeWidth = 30,
+              sinksRight = FALSE,height = 400,width = 800),
+tags$p("The size of the nodes on the right show the frequency of mention.",
+           style = "text-align:center; font-style:italic; margin-top:5px; color: black;font-size:14px;")
+  ),
+  tags$h3("Top Two Words Associated with AI in Job Titles", style = "text-align:center; font-family:Arial; color: black;font-size:16px;")
+)
+
+```
+
+
+- Most AI relate jobs were associated with software engineering. 
+- The strong association between AI-related jobs and software engineering roles suggests that AI is increasingly being embedded into software products and systems, indicating a growing demand for engineers who can integrate AI capabilities into scalable, and production-ready applications. 
+
+## Skills Associated with AI  
+```{r}
+#| label: Skills-related-AI
+#| include: true
+#| eval: true
+#| message: false
+#| warning: false
+
+# Filter rows where 'AI' is mentioned in Job_Title or description (case-insensitive)
+ai_rows <- tech.jobs[grepl("AI", `Job Title`, ignore.case = TRUE) | grepl("AI", Posting, ignore.case = TRUE),by=year]
+
+# Split skills and count each skill
+ai_skills <- ai_rows[, .(Skill = unlist(strsplit(Skills, ",\\s*"))),by=year]
+skill_counts <- ai_skills[, .N, by = c('Skill','year')][order(-N)]
+
+# Step 3: Count skills per year and get top 10 per year
+top_skills_by_year <- ai_skills[, .N, by = .(year, Skill)][
+  order(year, -N), 
+  .SD[1:10], 
+  by = year
+]
+
+# Ensure year is a factor for ordering
+top_skills_by_year[, year := as.factor(year)]
+
+# Plot with facets per year
+ggplot(top_skills_by_year, aes(x = reorder_within(Skill, N, year), y = N, fill = Skill)) +
+  geom_bar(stat = "identity", show.legend = FALSE, fill = "#55bc7e") +
+  geom_text(aes(label = N), 
+            hjust = -0.1, size = 3) +  # Adjust hjust for horizontal bars
+  coord_flip(clip = 'off') +
+  facet_wrap(~ year, scales = "free_y") +
+  scale_x_reordered() +  # needed to clean up axis labels
+  labs(
+    title = "Top 10 Skills Associated with AI",
+    subtitle = " ",
+    x = NULL,  # Remove x axis label as it's self-explanatory
+    y = "Number of Mentions",
+    caption = "Data source: Tech job listings analysis"
+  ) +
+  theme_classic() +
+  theme(strip.text = element_text(size = 12, face = "bold"),
+        plot.title = element_text(hjust = 0.5)) 
+
+```
+
+- Agile, Java, Python, and AWS consistently emerge as the top skills associated with AI roles over the past three years, reflecting their strong alignment with industry needs for AI-driven development, deployment, and collaboration.   
+
+- Cloud platforms gain increasing prominence, with AWS and Azure making notable appearances in 2024. AWS rapidly climbs from position 6 in 2024 to position 3 in 2025, while Azure advances from position 9 to 6, signaling growing demand for cloud-native AI capabilities. GCP enters the rankings in 2025, debuting at position 10, hinting at its rising relevance.    
+
+- Agile methodology sees a noticeable decline in prominence - while it tops the list in 2023, it drops to position 3 in 2024 and further to 4 in 2025. This trend may reflect a shifting focus toward more technical or platform-specific skills as AI roles evolve.     
+
+
+## AWS, GCP, and Azure mentions
+```{r}
+#| label: aws-gcp-azure-mentions
+#| include: true
+#| eval: true
+#| message: false
+#| warning: false
+
+
+# Combine the relevant columns into a single string per row
+azure.aws.gcp <- tech.jobs[, Combined := paste(`Job Title`, Skills, sep = " ")]
+
+# Define regex patterns for the cloud providers
+patterns <- list(
+  AWS   = "\\b(AWS|Amazon Web Services)\\b",
+  Azure = "\\bAzure\\b",
+  GCP   = "\\b(GCP|Google Cloud)\\b"
+)
+
+
+# Function to count mentions per pattern
+count_mentions <- function(data, column, pattern) {
+  sum(grepl(pattern, data[[column]], ignore.case = TRUE))
+}
+
+# Count by year
+comparisons <- azure.aws.gcp[, .(
+  AWS   = count_mentions(.SD, "Combined", patterns$AWS),
+  Azure = count_mentions(.SD, "Combined", patterns$Azure),
+  GCP   = count_mentions(.SD, "Combined", patterns$GCP)
+), by = year]
+
+# Convert to long format for ggplot
+comparisons_long <- melt(comparisons, id.vars = "year", variable.name = "Cloud_Platform", value.name = "Mentions")
+
+
+plot_ly(
+  data = comparisons_long,
+  x = ~as.factor(year),
+  y = ~Mentions,
+  color = ~Cloud_Platform,
+  type = 'scatter',
+  mode = 'lines+markers',
+  line = list(width = 2),
+  marker = list(size = 6),
+  width = 900,
+  height = 380
+) %>%
+  layout(
+    title = "Trends in Cloud Platform Mentions by Year",
+    xaxis = list(title = "Year"),
+    yaxis = list(title = "Number of Mentions"),
+    legend = list(title = list(text = "Cloud Platform")),
+    hovermode = "x unified"
+  ) %>%
+  config(displayModeBar = FALSE, displaylogo = FALSE, 
+              scrollZoom = FALSE, showAxisDragHandles = TRUE, 
+              showSendToCloud = FALSE)
+
+```
+
+- Across the three-year period, AWS consistently recorded the highest number of mentions, indicating its strong presence and popularity in the tech job market in Singapore. Azure followed closely behind, maintaining steady visibility, while GCP lagged with comparatively fewer mentions, suggesting lower demand or adoption in the roles analyzed.   
+
+
